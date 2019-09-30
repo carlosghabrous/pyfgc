@@ -1,0 +1,42 @@
+----- 19/07/2018: pyfgc API review (Quentin, Carlos) -----
+
+* code to unpack the log buffers and event log -> ask Joni/Joao
+* how to tell library where the name file is for non-CERN case?: library initialization? environment variable?
+* python version? -> not an issue
+* disconnect should accept devices as argument. By default, it disconnects every device
+* keep track of all devices behind a gateway when a connection is made even to one single device (internal dict, for instance)
+* API should know to which devices I am issuing an action: maybe use the "devices" argument in get/set
+* avail_devices or available, connections belongs more to the GW level (see sync.py)
+* subscribe: to property and/or UDP published data (SUB_XX)?
+* talk to Marc about pyfgc/classes/fgc_xx.py content:
+** looks like big part of the code could be initialized?
+** decode_bitmask function could be at a higher level?
+* subscribe: sync or async??
+
+
+----- 03/10/2018: pyfgc API review (Joao, Carlos) -----
+
+I have already written an initial API and the sync module at this point
+
+* pyfgc_name 
+** nothing as default, explicitly tell pyfgc_name where stuff is
+** think how to pass name file location for external labs (environment variable? config file?)
+
+* sync
+** KT gateway may use the port 1906, but 1905 is fine too
+** send token is not required for the KT gateway, but the code will work fine
+** when devices of an action are a superset of devices specified in "connect"
+*** right now: fail silently, do not include extra devices in response. Alternatives: 
+*** include device + exception in response?
+*** create connections and issue the actions? 
+
+* pyfgc
+** get token for external labs will fail, and likely throw an exception. Fix this. 
+
+* status monitor
+** Marc's way
+** KT gateway/CERN: write in a file host/port where to send publications. pyfgc client's should be able to tell pyfgc to which port to listen
+** publications are intended to stop when the TCP socket is closed. Issue with the library? 
+
+* async
+** blocking get/set, but also return  an awaitable object (coroutine), could be named get_async, set_async (will accept multiple devices as argument)

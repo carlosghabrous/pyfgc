@@ -1,0 +1,4 @@
+    - [EPCCCS-XXXX] Avoid calling pyfgc_name and pyfgc_rbac if protocol is serial
+    - [EPCCCS-7455] Rename protocol modules. Add consistency in function arguments naming
+    - [EPCCCS-7425] Change library's API
+    - [EPCCCS-6851] Improve pyfgc responses
