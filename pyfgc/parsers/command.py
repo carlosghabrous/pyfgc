@@ -76,9 +76,8 @@ def _encode_value(value):
     if isinstance(value, bytes):
         return struct.pack('!BL', 255, len(value)) + value
 
-    # list
-    if hasattr(value, '_getitem_'):
-
+    # list or tuple
+    if isinstance(value, (list, tuple, set)):
         str_list = [str(item) for item in value]
         return ",".join(str_list).encode()
 

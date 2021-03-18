@@ -1,6 +1,0 @@
-[
-  "tests/test_async.py::test_async_get_single",
-  "tests/test_async.py::test_async_get_multiple",
-  "tests/test_async.py::test_async_set_single",
-  "tests/test_async.py::test_async_set_multiple"
-]

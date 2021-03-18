@@ -16,7 +16,3 @@ class NetAsyncAdapter():
 
 class BootAdapter():
     pass
-
-
-class TerminalAdapter():
-    pass

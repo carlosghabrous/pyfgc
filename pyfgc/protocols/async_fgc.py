@@ -1,339 +1,404 @@
-import asyncio
-import builtins
-import socket
 import struct
-from collections import namedtuple
+import logging
+import asyncio
+import concurrent.futures
 
+from typing import Callable
+
+from .. import channel_manager
 import pyfgc.parsers.command as cmd
 import pyfgc.fgc_response as rsp
-import pyfgc_name
+
+# Logger
+logger = logging.getLogger('pyfgc.protocols.sync_fgc')
+logger.setLevel(logging.INFO)
 
 # Constants
-PORT = 1905
 PROTOCOL_NAME = __name__.rsplit(".")[-1].split("_")[0]
+HANDSHAKE_CHAR = '+'
+PORT = 1905
 
-# Globals
-try:
-    target_set
-
-except NameError:
-    target_set = builtins.set()
-
-try:
-    available_connections 
-
-except NameError:
-    available_connections = dict()
-
-try:
-    queued_commands
-
-except NameError:
-    queued_commands = dict()
-
-tag              = 0
-async_event_loop = None
-AsyncCommand     = namedtuple("AsyncCommand", ["tag", "device", "prop", "future"])
-
-def connect(targets, rbac_token, timeout_s):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        targets {[type]} -- [description]
-        rbac_token {[type]} -- [description]
-    
-    Keyword Arguments:
-        timeout_s {[type]} -- [description] (default: {TIMEOUT_S})
-    
-    Returns:
-        [type] -- [description]
+class AsyncFgcProtocol(asyncio.Protocol):
+    """
+    Asynchronous TCP interaction with a Gateway/FGC
     """
 
-    global target_set
-    target_set.update(targets)
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        """
+        This constructor is called only by the Loop.create_connection method
 
-    # Eliminate duplicates
-    gws = {pyfgc_name.devices[d.upper()]["gateway"] for d in targets}
+        :param loop:
+        """
+        self.loop = loop
+        self.transport = None
+        self.handshake_made = False
+        self.gateway = None
+        self.raw_mode = False
+        self.raw_stream = asyncio.StreamReader()
+        self.buffer = bytearray()
+        self.buffer_wait_n = 0
+        self.commands = dict()
+        self.tag_counter = 0
+        self.connection_lost_callbacks = set()
 
-    for gw in gws:
-        global available_connections
-        if not gw in available_connections.keys():
-            gw_devices = pyfgc_name.gateways[gw]["devices"]
+    def connection_made(self, transport: asyncio.Transport):
+        """
+        When connection has been made
 
-            available_connections[gw] = dict()
-            available_connections[gw]["devices"] = gw_devices
+        :param transport:
+        :return:
+        """
+        self.transport = transport
+        self.gateway = transport.get_extra_info("peername")
+        self.__send_handshake()
 
-            global async_event_loop
-            async_event_loop = asyncio.get_event_loop()
-            if async_event_loop.is_closed():
-                async_event_loop = asyncio.new_event_loop()
+    def add_connection_lost_callback(self, callback: Callable):
+        """
+        Run (non-coroutine) callback when connection is lost
+        """
+        self.connection_lost_callbacks.add(callback)
 
-            streams = async_event_loop.run_until_complete(_create_stream(gw))
-            available_connections[gw]["streams"] = streams
+    def connection_lost(self, exc):
+        """
+        When connection has been lost
 
-            try:
-                async_event_loop.run_until_complete(_handshake(streams, gw))
-                async_event_loop.run_until_complete(_set_token(rbac_token, gw, streams))
+        :param exc:
+        :return:
+        """
+        # TODO: Log exception
+        for fut in self.commands.values():
+            fut.cancel()
+        if exc:
+            for cb in self.connection_lost_callbacks:
+                cb()
 
-            except Exception as e:
-                async_event_loop.run_until_complete(_close_stream(streams[1]))
-                continue
+    def data_received(self, payload: bytes):
+        """
+        When something is received from the socket
 
-async def _create_stream(gw):
-    reader, writer = await asyncio.open_connection(gw, PORT)
-    return reader, writer
+        :param payload:
+        :return:
+        """
+        self.buffer += payload
 
-async def _close_stream(writer_stream):
-    writer_stream.close()
-    # This line is needed in python 3.7
-    # await writer_stream.wait_closed()
+        if not self.handshake_made:
+            # handshake
+            self.__process_handshake()
+        elif self.raw_mode:
+            # Provide data to stream
+            self.__process_raw_stream()
+        else:
+            # Parse result into a response
+            self.__process_responses(payload)
 
-def get(prop, get_option=None, targets=None):
-    return _command_engine(targets, prop, get_option, _async_get_single) 
+    def eof_received(self):
+        """
+        When the other end will not send more data
 
-def set(prop, value, targets=None):
-    return _command_engine(targets, prop, value, _async_set_single)
-            
-def disconnect(targets=None):
-    """[summary]
-    
-    [description]
-    
-    Keyword Arguments:
-        targets {[type]} -- [description] (default: {None})
-    """
-    
-    # Disconnect from selected targets or all targets   
-    global target_set
-    remove_targets = targets and targets or list(target_set)
+        :return:
+        """
+        super().eof_received()
 
-    # Update target set for future operations
-    target_set = target_set - builtins.set(remove_targets)
-    
-    # StreamWriters are closed only if no devices are specified (disconnect from all)
-    if not targets:
-        global async_event_loop
-        global available_connections
+    async def enable_rterm_mode(self, channel, command=None):
+        """
+        Use raw communication instead of NCRP protocol.
+        """
+        command = "CLIENT.RTERMLOCK" if command is None else command
+        result = await self.set(command, str(channel))
+        result.value
 
-        for gw in available_connections.keys():
-            s = available_connections[gw]["streams"]
+        self.raw_mode = True
+        self.data_received(b"") # Flush data to StreamReader
 
-            try:
-                async_event_loop.run_until_complete(_close_stream(s[1]))
+    def __send_handshake(self) -> None:
+        """
+        Send handshake to the gateway
+        """
+        self.transport.write(b'+')
 
-            except Exception as e:
-                print("Exception while closing streams: {}".format(e))
+    def __process_handshake(self) -> None:
+        """
+        Handle character when in 'waiting for handshake' mode
 
-        available_connections.clear()
+        :param payload:
+        :return:
+        """
+        # Remove first character from buffer
+        ack_char = chr(self.buffer.pop(0))
+        if ack_char != HANDSHAKE_CHAR:
+            raise ConnectionError(f"Handshake with gateway {self.gateway} not successful (received {ack_char} vs {HANDSHAKE_CHAR})!")
+        self.handshake_made = True
+
+    def __process_raw_stream(self):
+        # Just parse entire buffer into StreamReader
+        self.raw_stream.feed_data(self.buffer)
+        self.buffer.clear()
+
+    def __extract_response(self):
+        """
+        Gets a response from the buffer
+        :return: (tag, raw response, wait for N characters)
+        """
+        # NOTE: 'memoryview' will make the analysis of the buffer much more efficient.
+        # For example, for slicing bytearray without copying its contents.
+
+        # Check type of response (binary/non-binary/error)
+        match = rsp.NCRP_BEGIN.search(self.buffer)
+
+        if match and match.group(3) is not None:
+            # The next response is binary
+            span_begin, span_end = match.span()
+            tag = match.group(1).decode()
+            length = struct.unpack('>I', match.group(3))[0]
+
+            rsp_end = span_end + length
+            last_char = rsp_end + 2
+            if len(self.buffer) < last_char:
+                # BIN response is not ready. Wait for another N characters.
+                wait_n = last_char - len(self.buffer)
+                return (tag, None, wait_n) # Wait for another N characters
+
+            # Return response and character \xff at postion #0
+            with memoryview(self.buffer) as buffer_view:
+                raw_response = bytes(buffer_view[span_begin: last_char])
+                response = rsp.FgcSingleResponse(PROTOCOL_NAME, raw_response)
+            del self.buffer[:last_char]
+
+            return (tag, response, None) # Response is valid
+
+        elif match and match.group(2) is not None:
+            # The next response is non-binary
+            span_begin, span_end = match.span()
+            tag = match.group(1).decode()
+
+            rsp_end = self.buffer.find(b"\n;", span_end)
+            if rsp_end < 0:
+                return (tag, None, None) # Wait for another ? characters
+
+            last_char = rsp_end + 2
+
+            with memoryview(self.buffer) as buffer_view:
+                raw_response = bytes(buffer_view[span_begin: last_char])
+                response = rsp.FgcSingleResponse(PROTOCOL_NAME, raw_response)
+            del self.buffer[:last_char]
+
+            return (tag, response, None) # Response is valid
+
+        elif match and match.group(4) is not None:
+            # The next response is an error
+            span_begin, span_end = match.span()
+            tag = match.group(1).decode()
+
+            with memoryview(self.buffer) as buffer_view:
+                raw_response = bytes(buffer_view[span_begin: span_end])
+                response = rsp.FgcSingleResponse(PROTOCOL_NAME, raw_response)
+            del self.buffer[:span_end]
+
+            return (tag, response, None)
+
+        # If no match found
+        return (None, None, None) # Wait for another ? characters
+
+    def __process_responses(self, payload: bytes):
+
+        self.buffer_wait_n = max(self.buffer_wait_n - len(payload), 0)
+
+        # Check for '\n' only on new data (payload).
+        if payload != rsp.NET_RSP_VOID and \
+            (self.buffer_wait_n > 0 or rsp.NET_RSP_END not in payload):
+            return
+
+        while True:
+            result = self.__extract_response()
+            tag, raw_response, wait_n = result
+            if tag and raw_response:
+                self.__resolve_pending_request(tag, raw_response)
+            elif wait_n:
+                self.buffer_wait_n = wait_n
+                break
+            else:
+                break
+
+    def __new_tag(self):
+        self.tag_counter += 1
+        return "{:08X}".format(self.tag_counter)[:8]
+
+    def __register_pending_request(self, tag: str) -> asyncio.Future:
+        """
+        Register a pending command. The future will be resolved by the 'data_received' callback
+
+        :param tag:
+        :return:
+        """
+        self.commands[tag] = self.loop.create_future()
+        return self.commands[tag]
+
+    def __resolve_pending_request(self, tag: str, result: dict) -> None:
+        """
+        Resolves a previously pending request
+        :param result:
+        :return:
+        """
+        try:
+            future = self.commands[tag]
+        except KeyError as err:
+            raise KeyError(f"Tag {tag} is unknown.") from err
+        else:
+            del self.commands[tag]
 
         try:
-            async_event_loop.stop()
-            async_event_loop.close()
+            future.set_result(result)
+        except asyncio.InvalidStateError as err:
+            # During termination, futures may be cancelled by their callers
+            if not future.cancelled():
+                raise RuntimeError("Future was already set before.") from err
 
-        except Exception as e:
-            print("Disconnect: {}".format(e))
+    def disconnect(self):
+        """
+        Disconnects from the FGC
+        """
+        self.transport.close()
 
-def has_open_connections():
-    return len(available_connections) != 0
+    async def set(self, prop: str, value, device: str = ''):
+        """
+        Asynchronous set. Will resolve when the response arrives.
 
-def _get_command_targets(targets):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        targets {[type]} -- [description]
-    
-    Returns:
-        [type] -- [description]
-    """
-    global target_set
-    cmd_targets = targets and [d for d in targets if d in target_set] or list(target_set)
+        :param prop: property to set
+        :param value: value
+        :param device: device that should handle the command
+        :return: future that will be resolved when the response arrived
+        """
+        tag = self.__new_tag()
+        command = cmd.parse_set(device, "async", prop, value, tag=tag)
+        future = self.__register_pending_request(tag)
+        await self.send(command)
+        return await future
 
-    return cmd_targets
+    async def get(self, prop: str, get_option=None, device: str = ''):
+        """
+        Asynchronous get. Will resolve when the response arrives.
 
-async def _handshake(streams, gw):
-    reader, writer = streams
-    data = await reader.read(1)
+        :param prop: property to get
+        :param device: device that should handle the command
+        :return: future that will be resolved when the response arrived
+        """
+        tag = self.__new_tag()
+        command = cmd.parse_get(device, "async", prop, get_option, tag=tag)
+        future = self.__register_pending_request(tag)
+        await self.send(command)
+        return await future
 
-    if data != b"+":
-        raise ConnectionError("Handshake with gateway {} not successful!".format(gw))
+    def get_stream_reader(self):
+        """
+        Returns a StreamReader object buffering the received raw data.
+        :return: asyncio.StreamReader
+        """
+        return self.raw_stream
 
-    else:
-        writer.write(b"+")
+    async def send(self, payload: bytes):
+        """
+        Send given payload to the gateway
 
-async def _set_token(token, gw, streams):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        token {[type]} -- [description]
-        gw {[type]} -- [description]
-        channel {[type]} -- [description]
-    """ 
-    if token is None:
-        return
-        
-    reader, writer = streams
-    prop = "CLIENT.TOKEN"
-    tag, encoded_command = _build_command(gw, prop, token, cmd.parse_set)
-    _push_command(tag, gw, prop)
+        :param payload: Bytes to send
+        """
+        if self.transport and not self.transport.is_closing():
+            self.transport.write(payload)
+        else:
+            raise RuntimeError("Protocol is not open.")
 
-    try:
-        writer.write(encoded_command)
 
-    except Exception as e:
-        print("ERROR (set) for device {}, property {}: {}".format(gw, prop, e))
-        raise
+class AsyncFgc:
 
-    try:
-        await _get_response(reader, tag=tag)
+    protocol_dict = dict()
+    protocol_users = dict()
+    loop_locks = dict()
 
-    except Exception as e:
-        print("ERROR parsing response for device {}, property {}: {}".format(gw, prop, e))
-        raise
+    def __init__(self):
+        self.protocol   = None
+        self.loop       = None
+        self.target_fgc = None
+        self.target_gw  = None
+        self.rbac_token = None
+        self.timeout_s  = None
+        self.async_lock = None
 
-    finally: 
-        _pop_command(tag)
+    async def connect(self, loop, target_tuple, rbac_token, timeout_s):
 
-async def _async_get_single(target, prop, get_option=None, lock=None):
+        self.target_fgc, self.target_gw = target_tuple.pop()
+        self.rbac_token = rbac_token
+        self.timeout_s  = timeout_s
+        self.loop = loop
 
-    tag, encoded_command = _build_command(target, prop, get_option, cmd.parse_get)
-    _push_command(tag, target, prop)
+        try:
+            self.async_lock = self.loop_locks[self.loop]
+        except KeyError:
+            self.async_lock = asyncio.Lock()
+            self.loop_locks[self.loop] = self.async_lock
 
-    gw = pyfgc_name.devices[target.upper()]["gateway"]
+        async with self.async_lock:
+            try:
+                self.protocol = self.protocol_dict[self.loop, self.target_gw]
+                self.protocol_users[self.protocol] += 1
+            except KeyError:
+                _, self.protocol = await asyncio.wait_for(self.loop.create_connection(lambda: AsyncFgcProtocol(self.loop), self.target_gw, PORT), timeout=self.timeout_s)
+                self.protocol_dict[self.loop, self.target_gw] = self.protocol
+                self.protocol_users[self.protocol] = 1
 
-    try:
-        reader, writer = available_connections[gw]["streams"]
+                try:
+                    await self._set_token()
+                except asyncio.TimeoutError as err:
+                    del self.protocol_dict[self.loop, self.target_gw]
+                    del self.protocol_users[self.protocol]
+                    if self.protocol:
+                        self.protocol.disconnect()
+                    self.protocol = None
+                    raise asyncio.TimeoutError(f"S {self.target_gw}:CLIENT.TOKEN timeout.")
 
-        writer.write(encoded_command)
-        await writer.drain()
+            # If for some future reason the protocol fails, it should be disconnected properly
+            self.protocol.add_connection_lost_callback(
+                lambda: asyncio.run_coroutine_threadsafe(self.disconnect(), loop)
+            )
 
-        with await lock:
-            await _get_response(reader)
+    async def get(self, prop, get_option=None):
+        if not self.protocol:
+            raise RuntimeError("No protocol.")
+        try:
+            return await asyncio.wait_for(self.protocol.get(prop, get_option=get_option, device=self.target_fgc), timeout=self.timeout_s)
+        except asyncio.TimeoutError as err:
+            raise asyncio.TimeoutError(f"G {self.target_fgc}:{prop} timeout.")
 
-    except Exception as e:
-        print("ERROR (get) for device {}: {}".format(target, e))
+    async def set(self, prop, value):
+        if not self.protocol:
+            raise RuntimeError("No protocol.")
+        try:
+            return await asyncio.wait_for(self.protocol.set(prop, value, device=self.target_fgc), timeout=self.timeout_s)
+        except asyncio.TimeoutError as err:
+            raise asyncio.TimeoutError(f"S {self.target_fgc}:{prop} timeout.")
 
-async def _async_set_single(target, prop, value, lock=None):
+    async def disconnect(self):
+        async with self.async_lock:
+            if not self.protocol:
+                return
+            self.protocol_users[self.protocol] -= 1
+            if self.protocol_users[self.protocol] <= 0:
+                del self.protocol_dict[self.loop, self.target_gw]
+                del self.protocol_users[self.protocol]
+                self.protocol.disconnect()
+                self.protocol = None
 
-    tag, encoded_command = _build_command(target, prop, value, cmd.parse_set)
-    _push_command(tag, target, prop)
+    async def _set_token(self):
 
-    gw = pyfgc_name.devices[target.upper()]["gateway"]
+        if self.rbac_token is None:
+            logger.warning(f"Received None token for gateway {self.target_gw}. Token not set.")
+            return
 
-    try:
-        reader, writer = available_connections[gw]["streams"]
+        try:
+            set_result = await asyncio.wait_for(self.protocol.set("CLIENT.TOKEN", self.rbac_token), timeout=self.timeout_s)
+            set_result.value
+        except asyncio.TimeoutError as err:
+            raise asyncio.TimeoutError(f"S {self.target_gw}:CLIENT.TOKEN timeout.")
 
-        writer.write(encoded_command)
-        await writer.drain()
 
-        with await lock:
-            await _get_response(reader)
 
-    except Exception as e:
-        print("ERROR (get) for device {}: {}".format(target, e))
-    
-async def _async_multiple_action(command_targets, prop, cmd_argument, single_action_coroutine):
-    lock = asyncio.Lock()
 
-    tasks = [asyncio.ensure_future(
-        single_action_coroutine(target, prop, cmd_argument, lock)) 
-        for target in command_targets]
-
-    await asyncio.gather(*tasks)
-
-    fgc_rsp = rsp.FgcResponse(PROTOCOL_NAME)
-    global queued_commands
-
-    # Make an explicit copy of the dictionary keys, as it is being changed during the iteration
-    for tag in list(queued_commands.keys()):
-        fgc_rsp[queued_commands[tag].device] = queued_commands[tag].future.result()
-        _pop_command(tag)
-
-    return fgc_rsp
-
-def _command_engine(targets, prop, cmd_argument, single_action_coroutine):
-    command_targets = _get_command_targets(targets)
-
-    try:
-        global async_event_loop  
-        response = async_event_loop.run_until_complete(
-            _async_multiple_action(
-                command_targets, 
-                prop, 
-                cmd_argument, 
-                single_action_coroutine))
-
-    except Exception as e:
-        print("Exception in command_engine: {}".format(e))
-    response = rsp.FgcResponse(PROTOCOL_NAME)
-    
-    # Return dictionary if the command was issued to multiple targets
-    return response
-
-def _get_tag():
-    import sys
-
-    global tag
-    cycle_tag = tag % sys.maxsize
-    tag += 1
-    return cycle_tag
-
-def _build_command(target, prop, command_argument, encoder):
-    command_tag = _get_tag()
-    return command_tag, encoder(target, "async", prop, command_argument, command_tag)
-
-def _push_command(command_tag, target, prop):
-    global queued_commands
-    command_future = asyncio.Future()
-    queued_commands[command_tag] = AsyncCommand(command_tag, target, prop, command_future)
-
-async def _get_response(s, tag=None):
-    data = await _receive(s)
-    fgc_single_rsp = rsp.FgcSingleResponse(PROTOCOL_NAME, data)
-
-    command_tag = fgc_single_rsp.tag and int(fgc_single_rsp.tag) or tag
-    global queued_commands
-    try:
-        q_command = queued_commands[command_tag]
-
-    except KeyError:
-        pass
-    
-    q_command.future.set_result(fgc_single_rsp)
-
-def _pop_command(command_tag):
-
-    global queued_commands    
-    del queued_commands[command_tag]
-
-async def _receive(channel):
-    response = list()
-
-    received = await channel.read(1)
-    while received not in [rsp.NET_RSP_VOID, rsp.NET_RSP_END, rsp.NET_RSP_BIN_FLAG]:
-        response.append(received)
-        received = await channel.read(1)
-
-    response.append(received)
-
-    # Binary response
-    if received == rsp.NET_RSP_BIN_FLAG:
-        response_length_bytes = await channel.read(4)
-        response.append(response_length_bytes)
-
-        # Format string !L -> ! (network = big endian), L (unsigned long)
-        response_length_int = struct.unpack('!L', response_length_bytes)[0]
-
-        byte_counter = 0
-        while byte_counter < response_length_int:
-            incoming_bytes = await channel.read(response_length_int)
-            byte_counter += len(incoming_bytes)
-            response.append(incoming_bytes)
-
-    byte_rsp = b"".join(response)
-    return byte_rsp
+# EOF

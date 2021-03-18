@@ -3,16 +3,30 @@ import re
 NET_RSP_VOID        = b""
 NET_RSP_BIN_FLAG    = b"\xFF"
 NET_RSP_END         = b";"
+NET_ERROR           = b"!"
 
 SCRP_SUCCESS        = re.compile(rb"\$(?!\xff)([\w\W]*)\n;")
 SCRP_SUCCESS_BIN    = re.compile(rb"\$\xff([\x00-\xff]*)\n;$")
 SCRP_ERROR          = re.compile(rb"\$[\w\W]*\$([\w\W]*)\n!")
 
-NCRP_SUCCESS        = re.compile(rb"\$(\d{0,31})\s{1}\.\n(?!\xff)([\w\W]*)\n;")
-NCRP_SUCCESS_BIN    = re.compile(rb"\$(\d{0,31})\s{1}\.\n\xff([\x00-\xff]*)\n;$")
-NCRP_ERROR          = re.compile(rb"\$(\d{0,31})\s{1}!\n([\w\W]*)\n;")
+NCRP_SUCCESS        = re.compile(rb"\$(\w{0,31})\s{1}\.\n(?!\xff)([\w\W]*)\n;")
+NCRP_SUCCESS_BIN    = re.compile(rb"\$(\w{0,31})\s{1}\.\n\xff([\x00-\xff]*)\n;")
+NCRP_ERROR          = re.compile(rb"\$(\w{0,31})\s{1}!\n([\w\W]*)\n;")
 
-ERROR_CODE_MESSAGE  = re.compile(r"\s*(\d{1,})([\w\W]*)")
+'''
+NCRP_BEGIN - Optimized Regex
+
+Looks at beginning of a valid response, without parsing the value.
+This is more efficient when parsing responses (ex. binary) of multiple MB.
+
+Group 1: Match tag (returns tag)
+Group 2: Match is response is OK
+Group 3: Match if response is OK and binary (returns binary array size - not decoded)
+Group 4: Match if response if ERROR (returns error message and code)
+'''
+NCRP_BEGIN          = re.compile(rb"\$(\w{0,31})\s{1}(?:(?:\.\n((?:\xff([\x00-\xff]{4})|(?!\xff))))|(?:!\n((?:(?!\n    ;).)*)\n;))")
+
+ERROR_CODE_MESSAGE  = re.compile(r"\s*(\d{1,})\s([\w\W]*)")
 
 class FgcResponseError(Exception):
     pass
@@ -28,6 +42,10 @@ class FgcSingleResponse:
         FgcSingleResponse -- FgcSingleResponse object. 
     """
     def __init__(self, protocol, response=b"", err_policy="ignore"):
+
+        if protocol.lower() not in self.rsp_parsers:
+            raise FgcResponseError(f"FgcResponse: unrecognized FGC protocol {protocol}")
+
         self._value    = ""
         self._err_code = ""
         self._err_msg  = ""
@@ -70,24 +88,25 @@ class FgcSingleResponse:
     @staticmethod
     def parser_net(rsp, err_policy):
         """Parses network responses, for both the sync and async protocols.
-        
+
         Arguments:
             rsp {bytes} -- Byte string received from the FGC.
             err_policy {string} -- Policy for decoding errors (defaults to ignore)
-        
+
         Returns:
             tuple -- value, err_code, err_msg, tag
         """
         value, err_code, err_msg, tag = "", "", "", ""
-        m = NCRP_SUCCESS.search(rsp)
+
+        m = NCRP_SUCCESS.match(rsp)
         if m:
             tag, value = m.group(1).decode(errors=err_policy), m.group(2).decode(errors=err_policy)
 
-        m = NCRP_SUCCESS_BIN.search(rsp)
+        m = NCRP_SUCCESS_BIN.match(rsp)
         if m:
             tag, value = m.group(1).decode(errors=err_policy), m.group(2)
 
-        m = NCRP_ERROR.search(rsp)
+        m = NCRP_ERROR.match(rsp)
         if m:
             tag, error_string = m.group(1).decode(errors=err_policy), m.group(2).decode(errors=err_policy)
             err_code = ERROR_CODE_MESSAGE.search(error_string).group(1)
@@ -109,7 +128,7 @@ class FgcSingleResponse:
     def value(self):
         if (not self._value
             and (self._err_code or self._err_msg)):
-            raise FgcResponseError(f"{self._err_code}:{self._err_msg}")
+            raise FgcResponseError(f"{self._err_code}: {self._err_msg}")
             
         return self._value
     
@@ -223,7 +242,7 @@ class FgcResponse:
     def __str__(self):
         indv_rsps = list()
         for k in self._fgc_rsp:
-            indv_rsps.append(str(self._fgc_rsp[k]))
+            indv_rsps.append(f"{k} {str(self._fgc_rsp[k])}")
 
         new_line = "\n"
         return f"<FgcResponse: '{self.protocol}' '{new_line.join(indv_rsps)}'>"

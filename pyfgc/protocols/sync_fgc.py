@@ -1,263 +1,133 @@
-import builtins
-import socket
+import logging
 import struct
+import traceback
 
+from .. import channel_manager
 import pyfgc.parsers.command as cmd
 import pyfgc.fgc_response as rsp
-import pyfgc_name
+
+# Logger
+logger = logging.getLogger('pyfgc.protocols.sync_fgc')
+logger.setLevel(logging.INFO)
 
 # Constants
-PORT = 1905
 PROTOCOL_NAME = __name__.rsplit(".")[-1].split("_")[0]
 
+class SyncFgc:
+    def __init__(self):
+        self.channel    = None
+        self.target_fgc = None
+        self.target_gw  = None
+        self.rbac_token = None
+        self.timeout_s  = None
 
-# Globals
+    def connect(self, target_tuple, rbac_token, timeout_s):
+        self.target_fgc, self.target_gw = target_tuple.pop()
+        self.rbac_token = rbac_token
+        self.timeout_s  = timeout_s
 
-try:
-    target_set
+        try:
+            self.channel = channel_manager.get_channel(self.target_fgc, PROTOCOL_NAME, self.target_gw)
 
-except NameError:
-    target_set = builtins.set()
+        except Exception as e:
+            raise RuntimeError(f"Could not open socket with gateway {self.target_gw} for fgc {self.target_fgc}: {e}") from e
 
-try:
-    available_connections 
-
-except NameError:
-    available_connections = dict()
-
-# sync_logger = get_pyfgc_logger(__name__)
-
-def connect(targets, rbac_token, timeout_s):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        targets {[type]} -- [description]
-        rbac_token {[type]} -- [description]
-    
-    Keyword Arguments:
-        timeout_s {[type]} -- [description] (default: {TIMEOUT_S})
-    
-    Returns:
-        [type] -- [description]
-    """
-
-    global target_set
-    target_set.update(targets)
-
-    # Eliminate duplicated gateways if several targets are behind the same one
-    gws = {pyfgc_name.devices[d.upper()]["gateway"] for d in targets}
-    for gw in gws:
-        global available_connections
-        if not gw in available_connections.keys():
-            gw_devices = pyfgc_name.gateways[gw]["devices"]
-
-            available_connections[gw] = dict()
-            available_connections[gw]["devices"] = gw_devices
-            available_connections[gw]["socket"]  = None
-
+        #TODO: try moving set token to channel_manager
+        with self.channel.lock:
             try:
-                s = socket.socket()
-                s.settimeout(timeout_s)
-                s.connect((gw, PORT))
+                self._set_token()
 
             except Exception as e:
-                print(f"Could not open socket with gw {gw}: {e}")
-                continue
+                channel_manager.free_channel(self.target_fgc, PROTOCOL_NAME, self.target_gw)
+                self.channel = None
+                raise RuntimeError(f"Could not set token on gateway {self.target_gw}: {e}") from e
+
+            else:
+                self.channel.token_set = True
+
+    def get(self, prop, get_option=None):
+        return self._command_engine(prop, cmd.parse_get, cmd_argument=get_option)
+
+    def set(self, prop, value):
+        return self._command_engine(prop, cmd.parse_set, cmd_argument=value)
+
+    def disconnect(self):
+        try:
+            channel_manager.free_channel(self.target_fgc, PROTOCOL_NAME, self.target_gw)
+
+        except Exception:
+            logger.exception(f"Failed to disconnect from gateway {self.target_gw}, device {self.target_fgc}")
             
-            available_connections[gw]["socket"] = s
+        finally:
+            self.channel = None
 
-            try:
-                _handshake(s, gw)
-                _set_token(rbac_token, gw, s)
-
-            except Exception as e:
-                s.close()
-                s = None
-                continue    
-
-def get(prop, get_option=None, targets=None):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        prop {[type]} -- [description]
-    
-    Keyword Arguments:
-        targets {[type]} -- [description] (default: {None})
-    
-    Returns:
-        [type] -- [description]
-    """
-    return _command_engine(targets, prop, cmd.parse_get, cmd_argument=get_option)
-
-
-def set(prop, value, targets=None):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        prop {[type]} -- [description]
-        value {[type]} -- [description]
-    
-    Keyword Arguments:
-        targets {[type]} -- [description] (default: {None})
-    
-    Returns:
-        [type] -- [description]
-    """
-
-    return _command_engine(targets, prop, cmd.parse_set, cmd_argument=value)
-            
-
-def disconnect(targets=None):
-    """[summary]
-    
-    [description]
-    
-    Keyword Arguments:
-        targets {[type]} -- [description] (default: {None})
-    """
+    def renew_token(self, token):
+        self.rbac_token = token
+        self._set_token()
         
-   
-    global target_set
-    # Disconnect from selected targets or all target_set
-    remove_devices = targets and targets or list(target_set)
+    def _set_token(self):
+        if self.rbac_token is None:
+            logger.warning(f"Received None token for gateway {self.target_gw}. Token not set.")
+            return
 
-    # Update target set for future operations
-    target_set = target_set - builtins.set(remove_devices)
+        prop = "CLIENT.TOKEN"
+        set_command = cmd.parse_set(self.target_gw, PROTOCOL_NAME, prop, value=self.rbac_token)
+
+        try:
+            self.channel.write(set_command)
+
+        except Exception as e:
+            raise RuntimeError(f"ERROR (set) for device {self.target_gw}, property {prop}: {e}") from e
+
+        try:
+            self._receive()
+
+        except Exception as e:
+            raise RuntimeError(f"ERROR parsing response for device {self.target_gw}, property {prop}: {e}") from e
     
-    # Sockets are closed only if no targets are specified (disconnect from all)
-    if not targets:
-        global available_connections
-        for gw in available_connections.keys():
-            s = available_connections[gw]["socket"]
-            try:
-                s.close()
-            except:
-                pass
+    def _receive(self):
+        response = list()
 
-            available_connections[gw]["socket"] = None
+        received = self.channel.read(1)
+        while received not in [rsp.NET_RSP_VOID, rsp.NET_RSP_END, rsp.NET_RSP_BIN_FLAG]:
+            response.append(received)
+            received = self.channel.read(1)
 
-        available_connections.clear()
-
-
-def has_open_connections():
-    return len(available_connections) != 0
-
-def _get_command_targets(targets):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        targets {[type]} -- [description]
-    
-    Returns:
-        [type] -- [description]
-    """
-
-    global target_set
-    cmd_targets = targets and [d for d in targets if d in target_set] or list(target_set)
-
-    return cmd_targets
-
-
-def _handshake(s, gw):
-
-    if s.recv(1) != b"+":
-        raise ConnectionError("Handshake with gateway {} not successful!".format(gw))
-
-    else:
-        s.sendall(b"+")
-
-
-def _set_token(token, gw, channel):
-    """[summary]
-    
-    [description]
-    
-    Arguments:
-        token {[type]} -- [description]
-        gw {[type]} -- [description]
-        channel {[type]} -- [description]
-    """ 
-
-    if token is None:
-        return
-        
-    prop = "CLIENT.TOKEN"
-    set_command = cmd.parse_set(gw, "sync", prop, value=token)
-
-    try:
-        channel.sendall(set_command)
-
-    except Exception as e:
-        print(f"ERROR (set) for device {gw}, property {prop}: {e}")
-        raise
-
-    try:
-        _receive(channel)
-
-    except Exception as e:
-        print(f"ERROR parsing response for device {gw}, property {prop}: {e}")
-        raise
-
-
-def _receive(channel):
-    response = list()
-
-    received = channel.recv(1)
-    while received not in [rsp.NET_RSP_VOID, rsp.NET_RSP_END, rsp.NET_RSP_BIN_FLAG]:
         response.append(received)
-        received = channel.recv(1)
 
-    response.append(received)
+        # Binary response
+        if received == rsp.NET_RSP_BIN_FLAG:
+            response_length_bytes = self.channel.read(4)
+            response.append(response_length_bytes)
 
-    # Binary response
-    if received == rsp.NET_RSP_BIN_FLAG:
-        response_length_bytes = channel.recv(4)
-        response.append(response_length_bytes)
+            # Format string !L -> ! (network = big endian), L (unsigned long)
+            # Length read from the payload + 2 characters for the '\n;' in the end
+            response_length_int = struct.unpack('!L', response_length_bytes)[0] + 2
 
-        # Format string !L -> ! (network = big endian), L (unsigned long)
-        # Length read from the payload + 2 characters for the '\n;' in the end
-        response_length_int = struct.unpack('!L', response_length_bytes)[0] + 2
+            byte_counter = 0
+            while byte_counter < response_length_int:
+                incoming_bytes = self.channel.read(response_length_int - byte_counter)
+                byte_counter += len(incoming_bytes)
+                response.append(incoming_bytes)
 
-        byte_counter = 0
-        while byte_counter < response_length_int:
-            incoming_bytes = channel.recv(response_length_int - byte_counter)
-            byte_counter += len(incoming_bytes)
-            response.append(incoming_bytes)
+        byte_rsp = b"".join(response)
+        return byte_rsp
 
-    byte_rsp = b"".join(response)
-    return byte_rsp
+    def _command_engine(self, prop, command_encoder, cmd_argument):
+        response_dict   = dict()
+        encoded_command = command_encoder(self.target_fgc, "sync", prop, cmd_argument)
+        with self.channel.lock:
+            try:
+                self.channel.write(encoded_command)
 
+            except Exception as e:
+                raise RuntimeError(f"Exception while sending command {encoded_command} to fgc {self.target_fgc}") from e
 
-def _command_engine(targets, prop, command_encoder, cmd_argument):
-    command_targets = _get_command_targets(targets)
-    response_dict = dict()
+            try:
+                response_dict[self.target_fgc] = self._receive()
 
-    # global sync_logger
-    for t in command_targets:
-        encoded_command = command_encoder(t, "sync", prop, cmd_argument)
-        gw = pyfgc_name.devices[t.upper()]["gateway"]
+            except Exception as e:
+                raise RuntimeError(f"Exception while receiving response to command {encoded_command.decode()}: {repr(e)}, {traceback.print_exc()}") from e
 
-        try:
-            channel = available_connections[gw]["socket"]
-            channel.sendall(encoded_command)
+        return rsp.FgcResponse(PROTOCOL_NAME, response_dict)
 
-        except Exception as e:
-            # sync_logger.error(f"Device {t} could take action on property {prop}: {e}")
-            continue
-
-        try:
-            response_dict[t] = _receive(channel)
-
-        except Exception as e:
-            # sync_logger.error(f"Did not receive response from device {t}: {e}")
-            continue
-
-    return rsp.FgcResponse(PROTOCOL_NAME, response_dict)
